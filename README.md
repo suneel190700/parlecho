@@ -2,10 +2,12 @@
 
 Speech translation with voice-cloned dubbing. Takes an audio or video file in one
 language and produces the same audio in another language — same speakers' voices,
-same background music, translated dialogue.
+same background music, translated dialogue. A streaming mode dubs speech
+utterance-by-utterance as it arrives.
 
 ```
 parlecho dub interview.mp3 --to en
+python -m parlecho.streaming.orchestrator interview.mp3 --from es --to en
 ```
 
 ## Status
@@ -16,8 +18,9 @@ parlecho dub interview.mp3 --to en
 | WER/CER + BLEU benchmark, 5 pairs | done | `eval_results.md`, `eval_results_large.md` |
 | Speaker similarity benchmark | done | `eval_speaker_sim.md` |
 | CT2 int8 NLLB (CPU speedup + memory) | done | `eval_quant.md` |
+| Chunked streaming + latency instrumentation | done | `eval_latency.md` |
 | VRAM measurement (CUDA) | not started | needs GPU session |
-| Chunked streaming + latency instrumentation | not started | — |
+| Streaming latency on CUDA (sub-3s test) | not started | needs GPU session |
 | Context-aware short-segment translation | not started | — |
 | Sidechain music ducking | not started | — |
 
@@ -44,6 +47,29 @@ unified memory:
 6. **Remix** — each generated line is time-stretched (clamped to 0.75–1.35x)
    to fit its original slot, placed on the timeline, and mixed over the
    accompaniment stem.
+
+## Streaming mode
+
+Streaming (`parlecho/streaming/`) processes speech as it arrives instead of
+batch-processing a file. Design:
+
+- A Silero VAD chunker segments the incoming stream into utterances,
+  emitting each one ~0.42s after the speaker stops (the end-of-speech
+  silence window — an irreducible part of any streaming lag).
+- A resident-model worker (models loaded once, held hot) runs
+  faster-whisper → CT2 int8 NLLB → XTTS-v2 per utterance, greedy decoding
+  throughout — latency over marginal quality.
+- An orchestrator runs chunker and worker concurrently against the
+  real-time clock, so queue backpressure during dense speech is measured,
+  not hidden.
+
+**Lag** is defined as stream-time end of speech → dubbed chunk ready, and
+includes VAD detection and any queue wait.
+
+Streaming v1 scope, stated plainly: no source separation (music is not
+preserved), a single rolling clone reference built from the first ~10s of
+detected speech (no per-speaker diarization), and greedy decoding. The
+offline pipeline keeps music preservation and multi-speaker cloning.
 
 ## Benchmark results
 
@@ -118,6 +144,19 @@ CT2 int8 with beam_size=4 (32.1s) still outran HF fp32 greedy (36.9s) — int8
 buys back the full cost of 4-beam search. VRAM comparison on CUDA is pending
 (see Status).
 
+### Streaming latency (Apple M-series CPU)
+
+Real-time paced Spanish interview clip, es→en, whisper-small + CT2 int8 +
+XTTS-v2, greedy decoding, models resident before stream start. Per-utterance
+lag from stream-time end of speech to dubbed chunk ready, including ~0.42s
+VAD detection and queue wait under backpressure. Full table: `eval_latency.md`.
+
+**n=14 utterances — p50 lag 3.49s, p95 lag 6.36s.**
+
+TTS dominates per-utterance compute (60–80%); ASR is flat ~0.85s; CT2
+translation is 0.1–0.3s. CUDA measurement with the same harness is pending
+(see Status) — the sub-real-time target on GPU hardware is untested until then.
+
 ## Setup
 
 Requirements: Python 3.11, ffmpeg on PATH, a HuggingFace token with terms
@@ -129,7 +168,7 @@ pip install torch torchaudio
 pip install faster-whisper demucs "pyannote.audio>=3.1"
 pip install coqui-tts
 pip install "transformers>=4.57,<5" sentencepiece python-dotenv
-pip install soundfile librosa
+pip install soundfile librosa silero-vad
 pip install datasets "sacrebleu[ja]" jiwer speechbrain   # eval only
 pip install -e .
 echo "HF_TOKEN=hf_your_token" > .env
@@ -147,11 +186,15 @@ ct2-transformers-converter --model facebook/nllb-200-distilled-600M \
 ```
 parlecho dub input.mp3 --to en              # auto-detects source language
 parlecho dub input.mp4 --to en --from es    # or pin it
+
+# streaming mode (real-time paced; --no-realtime to run unpaced)
+python -m parlecho.streaming.orchestrator input.mp3 --from es --to en
 ```
 
-Output lands in `outputs/<input-name>/dubbed.wav`, with intermediate stems,
-per-speaker reference clips, and per-segment TTS in the same directory.
-Per-stage timing is printed on every run.
+Offline output lands in `outputs/<input-name>/dubbed.wav`, with intermediate
+stems, per-speaker reference clips, and per-segment TTS in the same directory.
+Streaming output lands in `outputs/stream/` as per-utterance chunks plus a
+latency report. Per-stage timing is printed on every run in both modes.
 
 Reproduce the benchmarks:
 
@@ -160,6 +203,7 @@ python -m parlecho.eval.run_eval --pairs es,fr,de,hi,ja --n 100 --whisper large-
 python -m parlecho.eval.speaker_sim --pairs es,fr,de,hi,ja --n 15
 python -m parlecho.eval.quant_bench --backend hf --n 100
 python -m parlecho.eval.quant_bench --backend ct2 --n 100
+python -m parlecho.streaming.orchestrator <clip> --from es --to en
 ```
 
 ## Performance
@@ -174,8 +218,11 @@ and NLLB run on MPS.
 ## Current limitations
 
 - Short-utterance translation: isolated one-word segments ("Paulo") can
-  hallucinate in NLLB without sentence context. Context-window translation is
-  planned (see Status).
+  hallucinate in NLLB without sentence context; streaming mode with
+  whisper-small + greedy decoding shows this most. Context-window translation
+  is planned (see Status).
+- Streaming v1 drops source separation and per-speaker diarization (see
+  Streaming mode section for the full scope statement).
 - Music ducking is static (fixed gain), not sidechained.
 - Overlapping dialogue: lines that exceed the stretch clamp spill into
   following silence and can collide in fast conversation.
