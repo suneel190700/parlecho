@@ -18,15 +18,18 @@ def transcribe(
     model_size: str = "small",
     language: str | None = None,   # None = auto-detect
     device: str = "cpu",
+    model=None,                    # pass a loaded WhisperModel to reuse it
 ) -> tuple[list[Segment], str]:
     """Transcribe audio. Returns (segments, detected_language)."""
     from faster_whisper import WhisperModel
 
-    model = WhisperModel(
-        model_size,
-        device=device,
-        compute_type="int8",   # fast on M-series CPU; harmless elsewhere
-    )
+    owns_model = model is None
+    if owns_model:
+        model = WhisperModel(
+            model_size,
+            device=device,
+            compute_type="int8",   # fast on M-series CPU; harmless elsewhere
+        )
 
     raw_segments, info = model.transcribe(
         str(vocals_path),
@@ -42,7 +45,8 @@ def transcribe(
         if s.text.strip()
     ]
 
-    del model
-    gc.collect()
+    if owns_model:
+        del model
+        gc.collect()
 
     return segments, info.language
