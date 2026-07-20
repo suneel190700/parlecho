@@ -15,7 +15,7 @@ parlecho dub interview.mp3 --to en
 | Offline pipeline (6 stages, CLI) | done | `parlecho dub`, timing in Performance section |
 | WER/CER + BLEU benchmark, 5 pairs | done | `eval_results.md`, `eval_results_large.md` |
 | Speaker similarity benchmark | done | `eval_speaker_sim.md` |
-| CT2 int8 NLLB (CPU speedup + memory) | in progress | — |
+| CT2 int8 NLLB (CPU speedup + memory) | done | `eval_quant.md` |
 | VRAM measurement (CUDA) | not started | needs GPU session |
 | Chunked streaming + latency instrumentation | not started | — |
 | Context-aware short-segment translation | not started | — |
@@ -37,7 +37,8 @@ unified memory:
 3. **Diarize** — pyannote speaker-diarization-3.1 tags each segment with a
    speaker and exports a 6–20s reference clip per speaker for voice cloning.
 4. **Translate** — NLLB-200 (distilled 600M) translates each segment,
-   preserving timing and speaker attribution.
+   preserving timing and speaker attribution. Two backends: HuggingFace fp32
+   and CTranslate2 int8 (see quantization results).
 5. **TTS** — XTTS-v2 speaks each translated line, cloned from that speaker's
    reference clip.
 6. **Remix** — each generated line is time-stretched (clamped to 0.75–1.35x)
@@ -101,6 +102,22 @@ every pair shows cross-lingual cloning preserves speaker identity. Absolute
 values in the 0.4–0.6 range are typical for cross-lingual cloning, which scores
 below same-language cloning.
 
+### Quantization (NLLB-600M: HF fp32 vs CTranslate2 int8)
+
+Matched greedy decoding (beam 1) on both backends, identical inputs, Apple
+M-series CPU.
+
+| Backend | Pair | n | BLEU | Translate time (s) | Sentences/s | Peak RSS (GB) |
+|---------|------|---|------|--------------------|-------------|----------------|
+| HF fp32 | es→en | 100 | 32.1 | 36.9 | 2.71 | 3.67 |
+| CT2 int8 | es→en | 100 | 32.9 | 13.6 | 7.38 | 2.33 |
+
+int8 quantization: 2.7x faster, no BLEU degradation, 36% lower peak process
+memory, and 599MB on disk vs ~2.4GB fp32 (75% smaller). In an unmatched run,
+CT2 int8 with beam_size=4 (32.1s) still outran HF fp32 greedy (36.9s) — int8
+buys back the full cost of 4-beam search. VRAM comparison on CUDA is pending
+(see Status).
+
 ## Setup
 
 Requirements: Python 3.11, ffmpeg on PATH, a HuggingFace token with terms
@@ -116,6 +133,13 @@ pip install soundfile librosa
 pip install datasets "sacrebleu[ja]" jiwer speechbrain   # eval only
 pip install -e .
 echo "HF_TOKEN=hf_your_token" > .env
+```
+
+To build the CT2 int8 translation backend:
+
+```
+ct2-transformers-converter --model facebook/nllb-200-distilled-600M \
+  --quantization int8 --output_dir models/nllb-600M-ct2
 ```
 
 ## Usage
@@ -134,6 +158,8 @@ Reproduce the benchmarks:
 ```
 python -m parlecho.eval.run_eval --pairs es,fr,de,hi,ja --n 100 --whisper large-v3
 python -m parlecho.eval.speaker_sim --pairs es,fr,de,hi,ja --n 15
+python -m parlecho.eval.quant_bench --backend hf --n 100
+python -m parlecho.eval.quant_bench --backend ct2 --n 100
 ```
 
 ## Performance
