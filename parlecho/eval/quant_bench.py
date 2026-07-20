@@ -7,6 +7,7 @@ python -m parlecho.eval.quant_bench --backend ct2 --n 100
 import argparse
 import resource
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -18,6 +19,38 @@ def peak_rss_gb() -> float:
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     # macOS reports bytes, Linux reports KB
     return rss / 1e9 if sys.platform == "darwin" else rss * 1024 / 1e9
+
+
+class VramSampler:
+    """Polls device memory via NVML at 20Hz. Reports peak used GB.
+    No-op (reports 0) on machines without NVIDIA GPUs."""
+
+    def __init__(self):
+        self.peak = 0
+        self._stop = False
+        self._handle = None
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._nvml = pynvml
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        except Exception:
+            pass
+
+    def _loop(self):
+        while not self._stop:
+            used = self._nvml.nvmlDeviceGetMemoryInfo(self._handle).used
+            self.peak = max(self.peak, used)
+            time.sleep(0.05)
+
+    def start(self):
+        if self._handle is not None:
+            self._t = threading.Thread(target=self._loop, daemon=True)
+            self._t.start()
+
+    def stop_gb(self) -> float:
+        self._stop = True
+        return round(self.peak / 1e9, 2) if self._handle is not None else 0.0
 
 
 def main():
@@ -43,26 +76,32 @@ def main():
         from parlecho.stages.translate_ct2 import translate_ct2 as run
         kwargs = {"device": args.device, "beam_size": 1}   # match HF greedy
 
+    vram = VramSampler()
+    vram.start()
+
     t_run = time.perf_counter()
     out = run(segs, args.source, "en", **kwargs)
     t_done = time.perf_counter()
 
+    peak_vram = vram.stop_gb()
     hyps = [s.text for s in out]
     bleu = sacrebleu.corpus_bleu(hyps, [refs]).score
     total_time = t_done - t_run
     sents_per_s = len(texts) / total_time
 
-    row = (f"| {args.backend} | {args.source}->en | {args.n} | "
+    row = (f"| {args.backend} | {args.device} | {args.source}->en | {args.n} | "
            f"{round(bleu, 1)} | {round(total_time, 1)} | "
-           f"{round(sents_per_s, 2)} | {round(peak_rss_gb(), 2)} |")
+           f"{round(sents_per_s, 2)} | {round(peak_rss_gb(), 2)} | "
+           f"{peak_vram} |")
 
     header = [
         "# Parlecho quantization benchmark — NLLB-600M, HF fp32 vs CTranslate2 int8",
         "",
         "Matched greedy decoding (beam 1) on both backends, identical inputs.",
+        "Peak VRAM sampled at device level via NVML (0.0 = no NVIDIA GPU).",
         "",
-        "| Backend | Pair | n | BLEU | Translate time (s) | Sentences/s | Peak RSS (GB) |",
-        "|---------|------|---|------|--------------------|-------------|----------------|",
+        "| Backend | Device | Pair | n | BLEU | Translate time (s) | Sentences/s | Peak RSS (GB) | Peak VRAM (GB) |",
+        "|---------|--------|------|---|------|--------------------|-------------|----------------|----------------|",
     ]
     if args.out.exists():
         args.out.write_text(args.out.read_text().rstrip() + "\n" + row + "\n")

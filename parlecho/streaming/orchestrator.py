@@ -17,8 +17,10 @@ from parlecho.streaming.worker import StreamWorker
 
 
 def run(input_path: Path, source: str, target: str, workdir: Path,
-        whisper_model: str, realtime: bool, out_report: Path) -> None:
-    worker = StreamWorker(source, target, workdir, whisper_model=whisper_model)
+        whisper_model: str, device: str, realtime: bool,
+        out_report: Path) -> None:
+    worker = StreamWorker(source, target, workdir, whisper_model=whisper_model,
+                          device=device)
     print(f"models resident in {worker.load_s:.1f}s — starting stream")
 
     q: queue.Queue = queue.Queue()
@@ -68,7 +70,7 @@ def run(input_path: Path, source: str, target: str, workdir: Path,
         f"# Parlecho streaming latency — whisper-{whisper_model} + CT2 int8 NLLB "
         f"+ XTTS-v2, greedy decoding",
         "",
-        f"Input: {input_path.name}, {source}->{target}, "
+        f"Input: {input_path.name}, {source}->{target}, device={device}, "
         f"{'real-time paced' if realtime else 'unpaced'}. "
         "Lag = stream-time end of speech to dubbed chunk ready; includes "
         "~0.42s VAD end-of-speech detection. Models resident before stream "
@@ -85,8 +87,8 @@ def run(input_path: Path, source: str, target: str, workdir: Path,
                      f"{r.get('translate','-')} | {r.get('tts','-')} | "
                      f"{r['text']} |")
     lines.append("")
-    lines.append("Hardware: Apple M-series CPU. Streaming v1 scope: no source "
-                 "separation, single rolling clone reference, greedy decoding.")
+    lines.append(f"Streaming v1 scope: no source separation, single rolling "
+                 "clone reference, greedy decoding.")
     out_report.write_text("\n".join(lines) + "\n")
     print(f"\np50 {p50:.2f}s  p95 {p95:.2f}s  ->  wrote {out_report}")
 
@@ -97,12 +99,17 @@ def main():
     p.add_argument("--from", dest="source", required=True)
     p.add_argument("--to", dest="target", required=True)
     p.add_argument("--whisper", default="small")
+    p.add_argument("--device", default="cpu")
     p.add_argument("--workdir", type=Path, default=Path("outputs/stream"))
     p.add_argument("--no-realtime", action="store_true")
     p.add_argument("--out", type=Path, default=Path("eval_latency.md"))
     args = p.parse_args()
     run(args.input, args.source, args.target, args.workdir,
-        args.whisper, not args.no_realtime, args.out)
+        args.whisper, args.device, not args.no_realtime, args.out)
+
+
+def _unused():
+    pass
 
 
 if __name__ == "__main__":
