@@ -1,7 +1,7 @@
 # Parlecho
 
 Speech translation with voice-cloned dubbing. Takes an audio or video file in one
-language and produces the same audio in another language — same speakers' voices,
+language and produces the same audio in another language - same speakers' voices,
 same background music, translated dialogue. A streaming mode dubs speech
 utterance-by-utterance as it arrives, with sub-second median lag on GPU.
 
@@ -32,19 +32,19 @@ done in the same commit that adds its evidence.
 Six-stage cascade, each model loaded sequentially so the pipeline runs on 16GB
 unified memory:
 
-1. **Separate** — Demucs (htdemucs) splits the input into a vocals stem and an
+1. **Separate** - Demucs (htdemucs) splits the input into a vocals stem and an
    accompaniment stem. Translation only touches dialogue; music and effects
    survive untouched.
-2. **ASR** — faster-whisper transcribes the vocals stem with word-level
+2. **ASR** - faster-whisper transcribes the vocals stem with word-level
    timestamps and VAD filtering.
-3. **Diarize** — pyannote speaker-diarization-3.1 tags each segment with a
+3. **Diarize** - pyannote speaker-diarization-3.1 tags each segment with a
    speaker and exports a 6–20s reference clip per speaker for voice cloning.
-4. **Translate** — NLLB-200 (distilled 600M) translates each segment,
+4. **Translate** - NLLB-200 (distilled 600M) translates each segment,
    preserving timing and speaker attribution. Two backends: HuggingFace fp32
    and CTranslate2 int8 (see quantization results).
-5. **TTS** — XTTS-v2 speaks each translated line, cloned from that speaker's
+5. **TTS** - XTTS-v2 speaks each translated line, cloned from that speaker's
    reference clip.
-6. **Remix** — each generated line is time-stretched (clamped to 0.75–1.35x)
+6. **Remix** - each generated line is time-stretched (clamped to 0.75–1.35x)
    to fit its original slot, placed on the timeline, and mixed over the
    accompaniment stem.
 
