@@ -3,7 +3,7 @@
 Speech translation with voice-cloned dubbing. Takes an audio or video file in one
 language and produces the same audio in another language — same speakers' voices,
 same background music, translated dialogue. A streaming mode dubs speech
-utterance-by-utterance as it arrives.
+utterance-by-utterance as it arrives, with sub-second median lag on GPU.
 
 ```
 parlecho dub interview.mp3 --to en
@@ -19,8 +19,8 @@ python -m parlecho.streaming.orchestrator interview.mp3 --from es --to en
 | Speaker similarity benchmark | done | `eval_speaker_sim.md` |
 | CT2 int8 NLLB (CPU speedup + memory) | done | `eval_quant.md` |
 | Chunked streaming + latency instrumentation | done | `eval_latency.md` |
-| VRAM measurement (CUDA) | not started | needs GPU session |
-| Streaming latency on CUDA (sub-3s test) | not started | needs GPU session |
+| VRAM measurement (CUDA, RTX 4090) | done | `eval_quant_gpu.md` |
+| Streaming latency on CUDA (sub-3s test) | done | `eval_latency_gpu.md` |
 | Context-aware short-segment translation | not started | — |
 | Sidechain music ducking | not started | — |
 
@@ -74,8 +74,10 @@ offline pipeline keeps music preservation and multi-speaker cloning.
 ## Benchmark results
 
 All quality metrics are measured on the FLEURS test split, n=100 sentences per
-pair (n=15 for speaker similarity), evaluated on Apple M-series CPU. Scripts to
-reproduce every table are in `parlecho/eval/`.
+pair (n=15 for speaker similarity). Quality metrics were evaluated on Apple
+M-series CPU; performance metrics are reported for both Apple M-series and an
+NVIDIA RTX 4090. Scripts to reproduce every table are in `parlecho/eval/` and
+`parlecho/streaming/`.
 
 ### ASR + translation quality (whisper-large-v3, NLLB-200-600M)
 
@@ -130,32 +132,42 @@ below same-language cloning.
 
 ### Quantization (NLLB-600M: HF fp32 vs CTranslate2 int8)
 
-Matched greedy decoding (beam 1) on both backends, identical inputs, Apple
-M-series CPU.
+Matched greedy decoding (beam 1) on both backends, identical inputs. Peak VRAM
+sampled at device level via NVML.
 
-| Backend | Pair | n | BLEU | Translate time (s) | Sentences/s | Peak RSS (GB) |
-|---------|------|---|------|--------------------|-------------|----------------|
-| HF fp32 | es→en | 100 | 32.1 | 36.9 | 2.71 | 3.67 |
-| CT2 int8 | es→en | 100 | 32.9 | 13.6 | 7.38 | 2.33 |
+| Backend | Device | Pair | n | BLEU | Time (s) | Sentences/s | Peak RSS (GB) | Peak VRAM (GB) |
+|---------|--------|------|---|------|----------|-------------|----------------|----------------|
+| HF fp32 | M-series CPU | es→en | 100 | 32.1 | 36.9 | 2.71 | 3.67 | — |
+| CT2 int8 | M-series CPU | es→en | 100 | 32.9 | 13.6 | 7.38 | 2.33 | — |
+| HF fp32 | RTX 4090 | es→en | 100 | 32.1 | 17.8 | 5.61 | 4.12 | 3.72 |
+| CT2 int8 | RTX 4090 | es→en | 100 | 32.7 | 4.5 | 22.4 | 1.87 | 2.28 |
 
-int8 quantization: 2.7x faster, no BLEU degradation, 36% lower peak process
-memory, and 599MB on disk vs ~2.4GB fp32 (75% smaller). In an unmatched run,
-CT2 int8 with beam_size=4 (32.1s) still outran HF fp32 greedy (36.9s) — int8
-buys back the full cost of 4-beam search. VRAM comparison on CUDA is pending
-(see Status).
+int8 quantization, with no BLEU degradation in any run:
 
-### Streaming latency (Apple M-series CPU)
+- **GPU: peak VRAM 3.72 → 2.28 GB (−38.7%) and 4.0x throughput.** Both VRAM
+  figures include fixed CUDA context overhead, so the model-only reduction is
+  steeper than the headline number.
+- CPU: 2.7x throughput and 36% lower peak process memory.
+- Disk: 599MB int8 vs ~2.4GB fp32 (75% smaller). In an unmatched run, CT2
+  int8 with beam_size=4 (32.1s) still outran HF fp32 greedy (36.9s) on CPU —
+  int8 buys back the full cost of 4-beam search.
+
+### Streaming latency
 
 Real-time paced Spanish interview clip, es→en, whisper-small + CT2 int8 +
 XTTS-v2, greedy decoding, models resident before stream start. Per-utterance
 lag from stream-time end of speech to dubbed chunk ready, including ~0.42s
-VAD detection and queue wait under backpressure. Full table: `eval_latency.md`.
+VAD detection and queue wait under backpressure. Full tables:
+`eval_latency.md` (CPU), `eval_latency_gpu.md` (CUDA).
 
-**n=14 utterances — p50 lag 3.49s, p95 lag 6.36s.**
+| Hardware | n | p50 lag | p95 lag |
+|----------|---|---------|---------|
+| Apple M-series CPU | 14 | 3.49s | 6.36s |
+| RTX 4090 | 14 | **0.83s** | **1.60s** |
 
-TTS dominates per-utterance compute (60–80%); ASR is flat ~0.85s; CT2
-translation is 0.1–0.3s. CUDA measurement with the same harness is pending
-(see Status) — the sub-real-time target on GPU hardware is untested until then.
+On GPU, every utterance completed in under 1.7s end to end — sub-second at
+the median. TTS dominates per-utterance compute on both platforms; ASR and
+CT2 translation are 0.02–0.18s each on GPU.
 
 ## Setup
 
@@ -196,7 +208,7 @@ stems, per-speaker reference clips, and per-segment TTS in the same directory.
 Streaming output lands in `outputs/stream/` as per-utterance chunks plus a
 latency report. Per-stage timing is printed on every run in both modes.
 
-Reproduce the benchmarks:
+Reproduce the benchmarks (add `--device cuda` on GPU):
 
 ```
 python -m parlecho.eval.run_eval --pairs es,fr,de,hi,ja --n 100 --whisper large-v3
@@ -228,6 +240,8 @@ and NLLB run on MPS.
   following silence and can collide in fast conversation.
 - Speaker similarity is measured at n=15 per pair (CPU TTS cost); the
   same/different separation is unambiguous but per-pair means are noisy.
+- GPU results are single-clip / single-pair sessions on one RTX 4090;
+  broader GPU sweeps were out of scope.
 
 ## License note
 
